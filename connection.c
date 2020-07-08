@@ -1,138 +1,114 @@
 #include "common.h"
-#include "connection.h"
-
-extern struct req_queue req_queue;
 
 struct connection {
 	int cfd, efd;
 	bool alive;
-	size_t pending_reqs;
-	struct string buf;
-	struct resp_queue resp_queue;
-	struct {
-		struct msg *resp;
-		size_t sent;
-	} sending;
+	struct queue *queue;
+	struct string *reading;
+	struct message *sending;
+	size_t msgs, sent;
 };
 
-struct connection *connection_create(int cfd, int efd)
+struct connection *connection(int cfd, int efd)
 {
+	print("accept %d", cfd);
 	struct connection *conn = malloc(sizeof(struct connection));
-	assert(conn);
 	conn->cfd = cfd;
 	conn->efd = efd;
 	conn->alive = true;
-	conn->pending_reqs = 0;
-	string_init(&conn->buf);
-	resp_queue_init(&conn->resp_queue);
-	conn->sending.resp = NULL;
-	conn->sending.sent = 0;
+	conn->queue = queue();
+	conn->reading = string();
+	conn->sending = NULL;
+	conn->msgs = conn->sent = 0;
 	return conn;
 }
 
-void connection_destroy(struct connection *conn)
+void _connection(struct connection *conn)
 {
+	print("close %d", conn->cfd);
 	close(conn->cfd);
-	resp_queue_destroy(&conn->resp_queue);
-	string_destroy(&conn->buf);
+	_string(conn->reading);
+	_queue(conn->queue);
 	free(conn);
 }
 
-bool connection_done(const struct connection *conn)
+bool dead(const struct connection *conn)
 {
-	return !conn->alive && conn->pending_reqs == 0;
+	return !conn->alive && conn->msgs == 0;
 }
 
-static void dispatch(struct connection *conn, const char *buf, size_t len)
+struct message *message(struct string *str, struct connection *conn)
 {
-	struct msg *req;
-	size_t beg, end;
-
-	for (beg = end = 0; end < len; ++end) {
-		if (buf[end] == '\0') {
-			string_append(&conn->buf, buf + beg, end - beg);
-			req = msg_create();
-			req->conn = conn;
-			string_move(&req->str, &conn->buf);
-			req_queue_push(&req_queue, req);
-			++conn->pending_reqs;
-			beg = end + 1;
-		}
-	}
-
-	if (beg < end)
-		string_append(&conn->buf, buf + beg, end - beg);
+	struct message *msg = malloc(sizeof(struct message));
+	msg->str = str;
+	msg->conn = conn;
+	return msg;
 }
 
-void connection_read(struct connection *conn, char *buf, size_t len)
+void Read(struct connection *conn)
 {
 	ssize_t n;
 
-	while ((n = read(conn->cfd, buf, len)) > 0)
-		dispatch(conn, buf, n);
-
-	if (n == -1 && errno == EAGAIN) {
-		log("EAGAIN");
-		return;
+	for (char buf[11]; (n = read(conn->cfd, buf, sizeof(buf))) > 0;) {
+		size_t b, e;
+		for (b = e = 0; e < n; ++e) {
+			if (buf[e] == '\n') {
+				append(conn->reading, buf + b, e - b + 1);
+				struct message *msg = message(conn->reading, conn);
+				conn->reading = string();
+				conn->msgs++;
+				push(Queue(), msg);
+				b = e + 1;
+			}
+		}
+		append(conn->reading, buf + b, e - b);
 	}
 
-	if (n == 0)
-		log("EOF");
-	else
-		perror("read");
+	if (n < 0 && errno == EAGAIN)
+		return;
 
 	conn->alive = false;
 }
 
-static void reset_sending(struct connection *conn)
+static void next(struct connection *conn)
 {
-	msg_destroy(conn->sending.resp);
-	conn->sending.resp = NULL;
-	conn->sending.sent = 0;
+	_string(conn->sending->str);
+	free(conn->sending);
+	conn->sending = NULL;
+	conn->sent = 0;
+	conn->msgs--;
 }
 
-void connection_write(struct connection *conn)
+void Send(struct connection *conn)
 {
-	const char *str;
-	size_t len;
-	ssize_t n;
-
-	while (conn->sending.resp
-	       || (conn->sending.resp = resp_queue_pop(&conn->resp_queue))) {
+	while (conn->sending || (conn->sending = pop(conn->queue))) {
 		if (!conn->alive) {
-			reset_sending(conn);
+			next(conn);
 			continue;
 		}
 
-		str = conn->sending.resp->str.str + conn->sending.sent;
-		len = conn->sending.resp->str.len - conn->sending.sent;
-		if ((n = write(conn->cfd, str, len)) < 0) {
-			if (errno == EAGAIN) {
-				log("EAGAIN");
-				return;
-			} else {
-				perror("write");
-				conn->alive = false;
-				reset_sending(conn);
-				continue;
-			}
+		size_t l = len(conn->sending->str) - conn->sent;
+		ssize_t n = write(conn->cfd, str(conn->sending->str) + conn->sent, l);
+		if (n < 0 && errno == EAGAIN)
+			return;
+
+		if (n < 0) {
+			perror("write");
+			conn->alive = false;
+		} else if (n == l) {
+			next(conn);
+		} else {
+			conn->sent += n;
 		}
-
-		if (n == len)
-			reset_sending(conn);
-		else
-			conn->sending.sent += n;
-
 	}
 }
 
-void connection_reply(struct connection *conn, struct msg *resp)
+void reply(struct connection *conn, struct message *msg)
 {
-	struct epoll_event ev;
-	ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-	ev.data.ptr = conn;
-
-	resp_queue_push(&conn->resp_queue, resp);
+	push(conn->queue, msg);
+	struct epoll_event ev = {
+		.events = EPOLLIN | EPOLLOUT | EPOLLET,
+		.data.ptr = conn
+	};
 	epoll_ctl(conn->efd, EPOLL_CTL_MOD, conn->cfd, &ev);
-	assert(!"EPOLL_CTL_MOD");
 }
